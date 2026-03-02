@@ -5,15 +5,15 @@
 
 ## 技术栈
 - **后端**: FastAPI, Python 3.10+, PyTorch
-  - 模型: `transformers.Sam2Model` (SAM2), `transformers.WhisperForConditionalGeneration` (Whisper), `dashscope` (Qwen VL)
+  - 模型: `transformers.Sam2Model` (SAM2), `transformers.WhisperForConditionalGeneration` (Whisper), `OpenAI Client` (Qwen VL 适配)
   - 音频处理: `moviepy` (无需系统级 FFmpeg)
 - **前端**: Vue 3, Vite, Element Plus
 
 ## 前置要求
-- Python 3.10+
+- Python 3.10+ (需安装 `transformers>=4.45.0`, `tokenizers>=0.22.0,<=0.23.0`, `huggingface_hub>=0.23.0`)
 - Node.js & npm
 - NVIDIA GPU (推荐用于加速推理，非必须)
-- [Dashscope API Key](https://help.aliyun.com/zh/dashscope/developer-reference/activate-dashscope-and-create-an-api-key) 用于 Qwen VL (可在前端界面动态输入)
+- **VLM API Key**: 推荐使用 [SiliconFlow](https://siliconflow.cn/) 或 [阿里云 Dashscope](https://help.aliyun.com/zh/dashscope/developer-reference/activate-dashscope-and-create-an-api-key) 的 API Key。
 
 ## 快速启动 (Windows)
 
@@ -22,7 +22,25 @@
    ```bash
    python start.py
    ```
-   *该脚本将自动检测后端虚拟环境并同时启动前端与后端服务。*
+   *该脚本将自动执行以下操作：*
+   - **依赖检测**: 检查并提示 `transformers` 和 `tokenizers` 版本是否匹配。
+   - **下载源选择**: 提供 **HF-Mirror (国内镜像)** 和官方源的选择，解决模型下载缓慢问题。
+   - **自动运行**: 同时启动后端 (8000端口) 和前端 (5173端口) 服务。
+
+## 故障排查 (Troubleshooting)
+
+### 1. 500 Internal Server Error (Analysis Failed)
+- **查看后端控制台**: 后端已增加详细的 `[CRITICAL ERROR]` 日志和堆栈追踪。
+- **维度不匹配**: SAM2 对 `transformers` 版本非常敏感，请确保运行 `pip install 'tokenizers>=0.22.0,<=0.23.0' --force-reinstall`。
+- **显存不足**: 尝试切换到 `facebook/sam2-hiera-tiny` 模型。
+
+### 2. Network Error / CORS 错误
+- **前端直连**: 如果 Vite 代理失效，前端会自动尝试直连 `http://127.0.0.1:8000`。
+- **CORS 配置**: 后端 `main.py` 已配置允许跨域请求。如果仍报错，请检查浏览器控制台 (F12) 的具体错误信息。
+
+### 3. 模型下载失败
+- 运行 `start.py` 时选择 `1. HF-Mirror`。
+- 或者手动设置环境变量：`set HF_ENDPOINT=https://hf-mirror.com`。
 
 ## 手动安装与运行
 
@@ -35,8 +53,6 @@ python -m venv venv
 
 # Windows 激活虚拟环境
 .\venv\Scripts\activate
-# Linux/Mac 激活虚拟环境
-source venv/bin/activate
 
 # 安装依赖
 pip install -r requirements.txt
@@ -57,8 +73,8 @@ npm run dev
 
 ### 3. 使用说明
 
-1. 打开浏览器访问前端地址 (通常为 `http://localhost:5173`)。
-2. **API Key**: 在上传界面输入您的 Dashscope API Key（可选，不输入将显示模拟数据）。
+1. 打开浏览器访问 。
+2. **API 配置**: 在展开的“API & Model Configuration”中输入 Base URL (如 `https://api.siliconflow.cn/v1`) 和 API Key。
 3. **上传**: 选择并上传一个本地视频文件 (MP4)。
 4. **交互**: 播放视频并在感兴趣的画面暂停，点击视频中的任意目标物体。
 5. **结果**:
@@ -68,6 +84,6 @@ npm run dev
 
 ## 注意事项
 
-- **首次运行**: 后端会自动从 Hugging Face 下载 SAM2 和 Whisper 模型，这可能需要一些时间。
-- **音频处理**: 现已切换至 `moviepy`，不再强制要求在系统中手动安装 FFmpeg，它会自动处理所需的二进制文件。
-- **API 密钥**: 为了安全起见，API Key 仅在前端输入并随请求发送给后端，后端不会永久存储。
+- **API 兼容性**: Qwen VL 模块现在使用标准 OpenAI 客户端格式，支持所有兼容 OpenAI 接口的服务商（如 SiliconFlow, 阿里云, 自建 VLM 等）。
+- **隐私安全**: API Key 仅保存在前端内存中，随请求发送，后端不进行任何持久化存储。
+- **音频处理**: `moviepy` 会自动处理所需的二进制文件，无需手动安装 FFmpeg。
