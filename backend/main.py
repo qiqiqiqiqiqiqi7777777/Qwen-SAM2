@@ -87,8 +87,10 @@ async def upload_video(file: UploadFile = File(...)):
 @app.post("/predict")
 async def predict(
     video_path: str = Form(...),
-    x: float = Form(...),
-    y: float = Form(...),
+    x: Optional[float] = Form(None),
+    y: Optional[float] = Form(None),
+    points_json: Optional[str] = Form(None),
+    labels_json: Optional[str] = Form(None),
     timestamp: float = Form(...),  # Time in seconds
     frame_width: int = Form(...),
     frame_height: int = Form(...),
@@ -130,16 +132,61 @@ async def predict(
         scale_x = orig_w / frame_width
         scale_y = orig_h / frame_height
         
-        actual_x = int(x * scale_x)
-        actual_y = int(y * scale_y)
+        final_points = []
+        final_labels = []
+
+        # Process new points/labels format
+        if points_json and labels_json:
+            try:
+                raw_points = json.loads(points_json)
+                raw_labels = json.loads(labels_json)
+                
+                if len(raw_points) != len(raw_labels):
+                    raise ValueError("Points and labels length mismatch")
+                
+                # Optimization: Downsample points if too many (e.g. scribble)
+                # SAM2 works best with fewer, well-placed points.
+                # If we have > 30 points, we take every K-th point.
+                if len(raw_points) > 30:
+                    step = len(raw_points) // 20
+                    raw_points = raw_points[::step]
+                    raw_labels = raw_labels[::step]
+                    print(f"[Main] Downsampled points from {len(raw_points)*step} to {len(raw_points)}")
+
+                for p in raw_points:
+                    final_points.append([int(p[0] * scale_x), int(p[1] * scale_y)])
+                final_labels = raw_labels
+                
+                print(f"[Main] Received {len(final_points)} points via JSON.")
+            except Exception as e:
+                print(f"[Main] Error parsing points_json/labels_json: {e}")
+        
+        # Fallback to single point if no list provided
+        if not final_points and x is not None and y is not None:
+            actual_x = int(x * scale_x)
+            actual_y = int(y * scale_y)
+            final_points = [[actual_x, actual_y]]
+            final_labels = [1]
+            print(f"[Main] Using legacy single point: ({actual_x}, {actual_y})")
+            
+        if not final_points:
+            raise HTTPException(status_code=400, detail="No points provided")
         
         print(f"--- Processing Start ---")
-        print(f"[Main] Click at ({x}, {y}) on {frame_width}x{frame_height} video.")
-        print(f"[Main] Mapped to frame coords: ({actual_x}, {actual_y}) in {orig_w}x{orig_h} frame.")
         
         # 3. SAM2 Inference
-        print(f"[Main] Step 2: Running SAM2 Segmentation...")
-        mask, masked_image = sam2_predictor.predict(frame, (actual_x, actual_y))
+        print(f"[Main] Step 2: Running SAM2 Video Segmentation with {len(final_points)} points...")
+        # Old single frame call:
+        # mask, masked_image = sam2_predictor.predict(frame, final_points, final_labels)
+        
+        # New video call:
+        output_video_path = sam2_predictor.predict_video(video_path, final_points, final_labels, timestamp)
+        
+        # We still need a single mask for QwenVL?
+        # QwenVL usually describes the object. 
+        # Let's use the mask from the *prompt frame* for QwenVL generation.
+        # So we can call predict() once for the prompt frame to get the mask/image for Qwen.
+        mask, masked_image = sam2_predictor.predict(frame, final_points, final_labels)
         
         # 4. Whisper Transcription
         print(f"[Main] Step 3: Running Whisper Transcription at {timestamp}s...")
@@ -159,13 +206,24 @@ async def predict(
         print(f"--- Processing End ---")
         
         # 6. Encode mask for response
+        # We return the video path now.
+        # But frontend expects "mask" as base64 image.
+        # We should update frontend to accept video url.
+        # For backward compatibility or immediate display, we can still return the frame mask.
+        # And ADD the video url.
+        
         _, buffer = cv2.imencode('.png', (mask * 255).astype(np.uint8))
         mask_base64 = base64.b64encode(buffer).decode('utf-8')
         
+        # Create a temp URL for the output video
+        output_filename = os.path.basename(output_video_path)
+        video_url = f"http://localhost:8000/temp/{output_filename}"
+        
         return JSONResponse({
-            "mask": f"data:image/png;base64,{mask_base64}",
+            "mask": f"data:image/png;base64,{mask_base64}", # Keep for Qwen logic/compatibility
             "transcription": audio_text,
-            "encyclopedia": encyclopedia_text
+            "encyclopedia": encyclopedia_text,
+            "segmented_video_url": video_url # New field
         })
 
     except Exception as e:

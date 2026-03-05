@@ -71,14 +71,57 @@
                 controls
                 class="video-player"
                 :src="videoSource"
-                @click="handleVideoClick"
+                crossorigin="anonymous"
+                @play="onVideoPlay"
+                @pause="onVideoPause"
+                @seeked="onVideoSeeked"
               ></video>
               
               <!-- Mask Overlay -->
-              <canvas ref="maskCanvas" class="mask-overlay"></canvas>
+              <canvas 
+                ref="maskCanvas" 
+                class="mask-overlay"
+                :style="{ 
+                  pointerEvents: interactionMode === 'view' ? 'none' : 'auto', 
+                  cursor: interactionMode === 'view' ? 'default' : 'crosshair',
+                  opacity: 1
+                }"
+                @mousedown="handleCanvasMouseDown"
+                @mousemove="handleCanvasMouseMove"
+                @mouseup="handleCanvasMouseUp"
+                @mouseleave="handleCanvasMouseLeave"
+              ></canvas>
             </div>
+            
+            <!-- Tools Toolbar -->
+            <div style="margin-top: 15px; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
+               <el-radio-group v-model="interactionMode" size="default">
+                 <el-radio-button label="view">
+                    <el-icon><VideoPlay /></el-icon> View
+                 </el-radio-button>
+                 <el-radio-button label="positive">
+                    <el-icon><CirclePlus /></el-icon> Point (+)
+                 </el-radio-button>
+                 <el-radio-button label="negative">
+                    <el-icon><Remove /></el-icon> Point (-)
+                 </el-radio-button>
+                 <el-radio-button label="scribble">
+                    <el-icon><EditPen /></el-icon> Scribble
+                 </el-radio-button>
+               </el-radio-group>
+               
+               <el-divider direction="vertical" />
+               <el-switch v-model="showPoints" active-text="Show Points" />
+               <el-divider direction="vertical" />
+               
+               <el-button type="warning" @click="undoLastPoint" :disabled="accumulatedPoints.length === 0">Undo</el-button>
+               <el-button type="danger" @click="clearAllPoints" :disabled="accumulatedPoints.length === 0">Clear</el-button>
+               <el-button type="primary" @click="runAnalysis" :loading="loading" :disabled="accumulatedPoints.length === 0">Analyze</el-button>
+            </div>
+
             <div style="margin-top: 10px; text-align: center;">
-              <el-text type="info">Click on an object in the video to analyze it.</el-text>
+              <el-text type="info" v-if="interactionMode === 'view'">Switch mode to interact with the video.</el-text>
+              <el-text type="info" v-else>Click or drag on the video to add {{ interactionMode }} prompts.</el-text>
             </div>
           </el-card>
         </el-col>
@@ -110,8 +153,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { UploadFilled } from '@element-plus/icons-vue'
+import { ref, onMounted, nextTick, watch } from 'vue'
+import { UploadFilled, VideoPlay, CirclePlus, Remove, EditPen } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const videoSource = ref(null)
@@ -128,6 +171,54 @@ const maskCanvas = ref(null)
 const loading = ref(false)
 const encyclopedia = ref(null)
 const transcription = ref(null)
+
+// Interaction State
+const interactionMode = ref('view') // view, positive, negative, scribble
+const accumulatedPoints = ref([]) // Array of {x, y, label}
+const isDrawing = ref(false)
+const currentMaskUrl = ref(null)
+const isPlaying = ref(false)
+const showPoints = ref(true)
+
+// Persist settings
+onMounted(() => {
+  const savedBaseUrl = localStorage.getItem('baseUrl')
+  if (savedBaseUrl) baseUrl.value = savedBaseUrl
+  
+  const savedApiKey = localStorage.getItem('apiKey')
+  if (savedApiKey) apiKey.value = savedApiKey
+  
+  const savedQwenModel = localStorage.getItem('qwenModel')
+  if (savedQwenModel) qwenModel.value = savedQwenModel
+  
+  const savedSam2Model = localStorage.getItem('sam2Model')
+  if (savedSam2Model) sam2Model.value = savedSam2Model
+})
+
+watch(baseUrl, (newVal) => localStorage.setItem('baseUrl', newVal))
+watch(apiKey, (newVal) => localStorage.setItem('apiKey', newVal))
+watch(qwenModel, (newVal) => localStorage.setItem('qwenModel', newVal))
+watch(sam2Model, (newVal) => localStorage.setItem('sam2Model', newVal))
+
+const onVideoPlay = () => {
+  isPlaying.value = true
+  redrawCanvas()
+}
+
+const onVideoPause = () => {
+  isPlaying.value = false
+  redrawCanvas()
+}
+
+const onVideoSeeked = () => {
+  isPlaying.value = false
+  redrawCanvas()
+}
+
+// Watch showPoints change to redraw
+watch(showPoints, () => {
+  redrawCanvas()
+})
 
 const handleUploadSuccess = (response) => {
   // response is { filename: "...", path: "..." }
@@ -148,12 +239,8 @@ const handleUploadProgress = (event) => {
   uploadProgress.value = Math.floor(event.percent)
 }
 
-const handleVideoClick = async (event) => {
-  if (loading.value) return
-
-  const video = videoElement.value
-  const rect = video.getBoundingClientRect()
-  
+// Coordinate Helper
+const getVideoCoordinates = (event, video, rect) => {
   // Calculate displayed video content dimensions (handling object-fit: contain)
   const videoRatio = video.videoWidth / video.videoHeight
   const elementRatio = rect.width / rect.height
@@ -180,119 +267,221 @@ const handleVideoClick = async (event) => {
   
   // Ignore clicks on black bars
   if (clickX < 0 || clickX > displayedWidth || clickY < 0 || clickY > displayedHeight) {
-    return
+    return null
   }
   
-  const timestamp = video.currentTime
-  const frameWidth = video.videoWidth // Intrinsic width
-  const frameHeight = video.videoHeight // Intrinsic height
+  const scaleX = video.videoWidth / displayedWidth
+  const scaleY = video.videoHeight / displayedHeight
   
-  const scaleX = frameWidth / displayedWidth
-  const scaleY = frameHeight / displayedHeight
-  
-  const actualX = clickX * scaleX
-  const actualY = clickY * scaleY
+  return {
+    x: clickX * scaleX,
+    y: clickY * scaleY,
+    displayX: clickX + offsetX,
+    displayY: clickY + offsetY
+  }
+}
 
+const handleCanvasMouseDown = (event) => {
+  if (interactionMode.value === 'view') return
+  
+  isDrawing.value = true
+  addPoint(event)
+}
+
+const handleCanvasMouseMove = (event) => {
+  if (!isDrawing.value) return
+  if (interactionMode.value === 'scribble') {
+    // Throttle or just add? Let's add every move for smooth scribble
+    addPoint(event)
+  }
+}
+
+const handleCanvasMouseUp = () => {
+  isDrawing.value = false
+  // Analysis is now triggered manually via the Analyze button
+}
+
+const handleCanvasMouseLeave = () => {
+  isDrawing.value = false
+}
+
+const addPoint = (event) => {
+  const video = videoElement.value
+  if (!video) return
+  
+  // Clear previous mask when adding new points (stale result)
+  if (currentMaskUrl.value) {
+    currentMaskUrl.value = null
+  }
+
+  const rect = video.getBoundingClientRect()
+  const coords = getVideoCoordinates(event, video, rect)
+  
+  if (coords) {
+    let label = 1
+    if (interactionMode.value === 'negative') label = 0
+    if (interactionMode.value === 'scribble') label = 1 // Default scribble as positive? Or make it configurable? Usually scribble is positive unless 'eraser'.
+    
+    // For scribble, we might want negative scribble too?
+    // Let's assume scribble follows the mode? But we have 'scribble' mode.
+    // If user selected 'scribble', let's assume positive. 
+    // If user wants negative region, maybe they should use 'negative' points or we add 'negative scribble'.
+    // For now, 'scribble' is positive.
+    
+    accumulatedPoints.value.push({
+      x: coords.x,
+      y: coords.y,
+      label: label,
+      displayX: coords.displayX, // Store for drawing on canvas (relative to video rect)
+      displayY: coords.displayY
+    })
+    
+    redrawCanvas()
+  }
+}
+
+const undoLastPoint = () => {
+  accumulatedPoints.value.pop()
+  if (currentMaskUrl.value) {
+      currentMaskUrl.value = null
+  }
+  redrawCanvas()
+}
+
+const clearAllPoints = () => {
+  accumulatedPoints.value = []
+  currentMaskUrl.value = null
+  redrawCanvas()
+  encyclopedia.value = null
+  transcription.value = null
+}
+
+const redrawCanvas = () => {
+  const canvas = maskCanvas.value
+  const video = videoElement.value
+  if (!canvas || !video) return
+  
+  const ctx = canvas.getContext('2d')
+  canvas.width = video.clientWidth
+  canvas.height = video.clientHeight
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  
+  // 1. Draw Mask if exists (Always draw mask regardless of playing state, unless user wants it hidden too? 
+  // User said "Mask should be there". So we draw it.)
+  if (currentMaskUrl.value) {
+      const img = new Image()
+      img.onload = () => {
+          ctx.globalCompositeOperation = 'screen'
+          ctx.globalAlpha = 0.6
+          
+          // Re-calculate video rect
+          const vLeft = 0 // Relative to canvas
+          const vTop = 0
+          const vWidth = canvas.width
+          const vHeight = canvas.height
+          
+          const videoRatio = video.videoWidth / video.videoHeight
+          const elementRatio = vWidth / vHeight
+          
+          let displayedWidth, displayedHeight, offsetX, offsetY
+          
+          if (elementRatio > videoRatio) {
+            displayedHeight = vHeight
+            displayedWidth = displayedHeight * videoRatio
+            offsetX = (vWidth - displayedWidth) / 2
+            offsetY = 0
+          } else {
+            displayedWidth = vWidth
+            displayedHeight = displayedWidth / videoRatio
+            offsetX = 0
+            offsetY = (vHeight - displayedHeight) / 2
+          }
+          
+          ctx.drawImage(img, offsetX, offsetY, displayedWidth, displayedHeight)
+          
+          ctx.globalCompositeOperation = 'source-over'
+          ctx.globalAlpha = 1.0
+          
+          // Only draw points if not playing AND showPoints is enabled
+          if (!isPlaying.value && showPoints.value) {
+             drawPointsOverlay(ctx)
+          }
+      }
+      img.src = currentMaskUrl.value
+  } else {
+      // If no mask, still draw points if conditions met
+      if (!isPlaying.value && showPoints.value) {
+          drawPointsOverlay(ctx)
+      }
+  }
+}
+
+const drawPointsOverlay = (ctx) => {
+    // Draw points
+    accumulatedPoints.value.forEach(p => {
+        ctx.beginPath()
+        ctx.arc(p.displayX, p.displayY, 4, 0, 2 * Math.PI)
+        ctx.fillStyle = p.label === 1 ? 'green' : 'red'
+        ctx.fill()
+        ctx.strokeStyle = 'white'
+        ctx.lineWidth = 1
+        ctx.stroke()
+    })
+}
+
+const runAnalysis = async () => {
+  if (loading.value || accumulatedPoints.value.length === 0) return
+  
   loading.value = true
-  reset()
-
+  
   try {
+    const video = videoElement.value
     const formData = new FormData()
-    formData.append('video_path', serverVideoPath.value) // Use absolute path on server
-    formData.append('x', actualX)
-    formData.append('y', actualY)
-    formData.append('timestamp', timestamp)
-    formData.append('frame_width', frameWidth)
-    formData.append('frame_height', frameHeight)
-    if (apiKey.value) {
-      formData.append('api_key', apiKey.value)
-    }
-    if (baseUrl.value) {
-      formData.append('base_url', baseUrl.value)
-    }
+    formData.append('video_path', serverVideoPath.value)
+    
+    const points = accumulatedPoints.value.map(p => [p.x, p.y])
+    const labels = accumulatedPoints.value.map(p => p.label)
+    
+    formData.append('points_json', JSON.stringify(points))
+    formData.append('labels_json', JSON.stringify(labels))
+    
+    formData.append('timestamp', video.currentTime)
+    formData.append('frame_width', video.videoWidth)
+    formData.append('frame_height', video.videoHeight)
+    
+    if (apiKey.value) formData.append('api_key', apiKey.value)
+    if (baseUrl.value) formData.append('base_url', baseUrl.value)
     formData.append('qwen_model', qwenModel.value)
     formData.append('sam2_model', sam2Model.value)
 
-    // Direct request to backend bypassing Vite proxy for debugging
     const response = await axios.post('http://127.0.0.1:8000/predict', formData)
+    const result = response.data
     
-    transcription.value = response.data.transcription
-    encyclopedia.value = response.data.encyclopedia
+    transcription.value = result.transcription
+    encyclopedia.value = result.encyclopedia
     
-    drawMask(response.data.mask)
+    if (result.segmented_video_url) {
+      // If we have a segmented video, use it and CLEAR the static mask overlay
+      // because the video itself contains the visualization.
+      currentMaskUrl.value = null 
+      
+      videoElement.value.pause()
+      videoSource.value = result.segmented_video_url
+      setTimeout(() => {
+        if (videoElement.value) videoElement.value.play()
+      }, 500)
+    } else {
+        // Only show static mask if NO video result (fallback)
+        currentMaskUrl.value = result.mask
+    }
+    
+    redrawCanvas() // Trigger redraw with new mask state
+    
   } catch (err) {
     console.error(err)
     alert("Analysis failed: " + (err.response?.data?.detail || err.message))
   } finally {
     loading.value = false
-  }
-}
-
-const drawMask = (maskDataUrl) => {
-  const canvas = maskCanvas.value
-  const wrapper = videoWrapper.value
-  const video = videoElement.value
-  
-  if (!canvas || !wrapper || !video) return
-
-  const ctx = canvas.getContext('2d')
-  
-  // Set canvas size to match wrapper size
-  canvas.width = wrapper.clientWidth
-  canvas.height = wrapper.clientHeight
-  
-  const img = new Image()
-  img.onload = () => {
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    
-    // Calculate video content position relative to wrapper
-    // 1. Video Element position relative to Wrapper
-    const vLeft = video.offsetLeft
-    const vTop = video.offsetTop
-    const vWidth = video.clientWidth
-    const vHeight = video.clientHeight
-    
-    // 2. Video Content position relative to Video Element (Object Fit)
-    const videoRatio = video.videoWidth / video.videoHeight
-    const elementRatio = vWidth / vHeight
-    
-    let displayedWidth, displayedHeight, offsetX, offsetY
-    
-    if (elementRatio > videoRatio) {
-      displayedHeight = vHeight
-      displayedWidth = displayedHeight * videoRatio
-      offsetX = (vWidth - displayedWidth) / 2
-      offsetY = 0
-    } else {
-      displayedWidth = vWidth
-      displayedHeight = displayedWidth / videoRatio
-      offsetX = 0
-      offsetY = (vHeight - displayedHeight) / 2
-    }
-    
-    // 3. Final Draw Coordinates
-    const destX = vLeft + offsetX
-    const destY = vTop + offsetY
-    
-    // Draw mask with screen blend mode (makes black transparent)
-    ctx.globalCompositeOperation = 'screen'
-    ctx.globalAlpha = 0.6
-    ctx.drawImage(img, destX, destY, displayedWidth, displayedHeight)
-    
-    // Reset context
-    ctx.globalCompositeOperation = 'source-over'
-    ctx.globalAlpha = 1.0
-  }
-  img.src = maskDataUrl
-}
-
-const reset = () => {
-  encyclopedia.value = null
-  transcription.value = null
-  const canvas = maskCanvas.value
-  if (canvas) {
-    const ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
   }
 }
 </script>

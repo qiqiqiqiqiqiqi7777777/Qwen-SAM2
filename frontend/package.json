@@ -9,11 +9,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "vue": "^3.4.21",
-    "element-plus": "^2.6.1",
+    "@element-plus/icons-vue": "^2.3.2",
+    "@videojs-player/vue": "^1.0.0",
     "axios": "^1.6.8",
+    "element-plus": "^2.6.1",
     "video.js": "^8.10.0",
-    "@videojs-player/vue": "^1.0.0"
+    "vue": "^3.4.21"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.4",

@@ -49,10 +49,11 @@ class Sam2Predictor:
             print(f"Detailed Error: {e}")
             raise RuntimeError(f"SAM2 Loading Failed: {e}. Please ensure model files are fully downloaded.")
 
-    def predict(self, frame, point):
+    def predict(self, frame, points, labels):
         """
         frame: numpy array (H, W, 3) BGR (cv2 default)
-        point: (x, y) tuple
+        points: list of [x, y] coordinates
+        labels: list of int (1 for positive, 0 for negative)
         Returns: mask (H, W) binary, masked_image (PIL Image)
         """
         # Prepare inputs
@@ -63,11 +64,15 @@ class Sam2Predictor:
         # input_points: 4 dimensions (image_dim, object_dim, point_per_object_dim, coordinates)
         # input_labels: 3 dimensions (image_dim, object_dim, point_label)
         
-        input_points = [[[[point[0], point[1]]]]] # 4D: (1, 1, 1, 2)
-        input_labels = [[[1]]]                    # 3D: (1, 1, 1)
+        # Ensure points and labels are properly formatted
+        # points should be list of lists: [[x1, y1], [x2, y2], ...]
+        # labels should be list of ints: [1, 0, ...]
         
-        print(f"[SAM2] Predict called for point: {point}")
+        input_points = [[points]] # 4D: (1, 1, N, 2)
+        input_labels = [[labels]] # 3D: (1, 1, N)
+        
         try:
+            print(f"[SAM2] Predict called for {len(points)} points")
             inputs = self.processor(
                 images=image, 
                 input_points=input_points, 
@@ -79,22 +84,15 @@ class Sam2Predictor:
                 outputs = self.model(**inputs)
             
             # Post-process masks
-            # masks is a list of tensors
             masks = self.processor.post_process_masks(
                 outputs.pred_masks.cpu(), 
                 inputs["original_sizes"].cpu()
-            )[0] # Get the first (and only) image's masks
+            )[0]
             
-            # Each object gets its own masks. Shape: (num_objects, num_masks, H, W)
-            # For single point click, num_objects = 1.
             predicted_masks = masks[0] # (num_masks, H, W)
-            
-            # iou_scores shape: (batch_size, num_objects, num_masks)
-            # We need to handle different possible output shapes from different SAM2 versions
             scores = outputs.iou_scores.cpu().numpy()
-            print(f"[SAM2] IOU scores shape: {scores.shape}")
             
-            # Navigate to the correct dimension based on shape
+            # Handle score dimensions
             if len(scores.shape) == 3: # (batch, objects, masks)
                 iou_scores = scores[0][0]
             elif len(scores.shape) == 2: # (batch, masks)
@@ -105,15 +103,231 @@ class Sam2Predictor:
             best_mask_idx = np.argmax(iou_scores)
             best_mask = predicted_masks[best_mask_idx].numpy() # (H, W) boolean
             
-            print(f"[SAM2] Best mask index: {best_mask_idx}, IOU score: {iou_scores[best_mask_idx]:.4f}")
-            print(f"[SAM2] Mask pixel count: {np.sum(best_mask)}")
-            
             return best_mask.astype(np.uint8), image
         except Exception as e:
             print(f"[SAM2 ERROR] Inference failed: {e}")
             import traceback
             print(traceback.format_exc())
             raise e
+
+    def predict_video(self, video_path, points, labels, timestamp):
+        """
+        Perform video object segmentation.
+        Since we don't have the full Sam2VideoPredictor from the official repo (we are using transformers),
+        we implement a frame-by-frame tracking loop using the image model.
+        This is a simplified approach:
+        1. Segment the prompt frame.
+        2. Use the mask from frame T as a prompt (box or mask) for frame T+1.
+        3. Repeat for the whole video.
+        
+        Returns: Path to the output video with mask overlay.
+        """
+        import tempfile
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open video")
+            
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        prompt_frame_idx = int(timestamp * fps)
+        
+        # Output video
+        output_path = video_path.replace(".mp4", "_segmented.mp4")
+        # Use moviepy for better compatibility
+        # fourcc = cv2.VideoWriter_fourcc(*'avc1') 
+        # out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        print(f"[SAM2 Video] Processing {total_frames} frames. Prompt at frame {prompt_frame_idx}")
+        
+        # Read all frames to memory? Video might be large.
+        # But we need random access for propagation (start from middle).
+        # Let's read them into a list if memory allows (SAM2 usually requires high memory anyway).
+        # For long videos, this might crash. But let's assume reasonable size for now.
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+        
+        if not frames:
+            raise RuntimeError("No frames read from video")
+
+        # Initialize masks array
+        masks = [None] * len(frames)
+        
+        # 1. Segment Prompt Frame
+        print(f"[SAM2 Video] Segmenting prompt frame {prompt_frame_idx}...")
+        prompt_mask, _ = self.predict(frames[prompt_frame_idx], points, labels)
+        masks[prompt_frame_idx] = prompt_mask
+        
+        # 2. Propagate Forward
+        current_mask = prompt_mask
+        for i in range(prompt_frame_idx + 1, len(frames)):
+            if i % 10 == 0: print(f"[SAM2 Video] Propagating forward frame {i}/{len(frames)}")
+            
+            # Use previous mask to get a bounding box or mask prompt
+            # Using mask directly as prompt is better if supported.
+            # Transformers Sam2Model supports 'input_masks' (batch, num_masks, H, W)
+            # But we need to ensure dimensions are correct.
+            # The model expects raw mask logits usually? Or boolean?
+            # Actually, standard SAM uses low-res mask (256x256).
+            # If we pass full res mask, we might need to resize.
+            # For simplicity in this "hacky" video loop:
+            # We calculate the bounding box of the previous mask and use it as a box prompt.
+            # This is robust for tracking.
+            
+            rows, cols = np.where(current_mask > 0)
+            if len(rows) > 0:
+                y_min, y_max = np.min(rows), np.max(rows)
+                x_min, x_max = np.min(cols), np.max(cols)
+                # Add margin
+                margin = 10
+                # Ensure values are standard python int, not numpy.int64
+                box = [
+                    int(max(0, x_min - margin)),
+                    int(max(0, y_min - margin)),
+                    int(min(width, x_max + margin)),
+                    int(min(height, y_max + margin))
+                ]
+                # Box format for SAM2: [[x1, y1, x2, y2]]
+                # Processor expects input_boxes=[[[x1, y1, x2, y2]]]
+                # Error says: expected 3 levels [image level, box level, box coordinates], got 4.
+                # So we should pass input_boxes=[[box]]
+                # Because images=image (1 image), so outer list is for image batch.
+                # Inside is list of boxes for that image.
+                # Each box is [x1, y1, x2, y2].
+                
+                # Convert frame to RGB
+                rgb_frame = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(rgb_frame)
+                
+                inputs = self.processor(
+                    images=image, 
+                    input_boxes=[[box]], 
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                
+                # Post process
+                m = self.processor.post_process_masks(
+                    outputs.pred_masks.cpu(), 
+                    inputs["original_sizes"].cpu()
+                )[0]
+                
+                # Take best mask
+                iou = outputs.iou_scores.cpu().numpy()
+                if len(iou.shape) == 3: iou = iou[0][0]
+                else: iou = iou.flatten()
+                
+                best_idx = np.argmax(iou)
+                current_mask = m[0][best_idx].numpy().astype(np.uint8)
+            else:
+                # Object lost
+                current_mask = np.zeros((height, width), dtype=np.uint8)
+                
+            masks[i] = current_mask
+
+        # 3. Propagate Backward
+        current_mask = prompt_mask
+        for i in range(prompt_frame_idx - 1, -1, -1):
+            if i % 10 == 0: print(f"[SAM2 Video] Propagating backward frame {i}")
+            
+            rows, cols = np.where(current_mask > 0)
+            if len(rows) > 0:
+                y_min, y_max = np.min(rows), np.max(rows)
+                x_min, x_max = np.min(cols), np.max(cols)
+                margin = 10
+                # Ensure values are standard python int, not numpy.int64
+                box = [
+                    int(max(0, x_min - margin)),
+                    int(max(0, y_min - margin)),
+                    int(min(width, x_max + margin)),
+                    int(min(height, y_max + margin))
+                ]
+                
+                # Backward propagation box input
+                rgb_frame = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(rgb_frame)
+                
+                inputs = self.processor(
+                    images=image, 
+                    input_boxes=[[box]], 
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                
+                m = self.processor.post_process_masks(
+                    outputs.pred_masks.cpu(), 
+                    inputs["original_sizes"].cpu()
+                )[0]
+                
+                iou = outputs.iou_scores.cpu().numpy()
+                if len(iou.shape) == 3: iou = iou[0][0]
+                else: iou = iou.flatten()
+                best_idx = np.argmax(iou)
+                current_mask = m[0][best_idx].numpy().astype(np.uint8)
+            else:
+                current_mask = np.zeros((height, width), dtype=np.uint8)
+                
+            masks[i] = current_mask
+            
+        # 4. Write Video with Overlay using MoviePy (Better compatibility)
+        print(f"[SAM2 Video] Writing output video with MoviePy...")
+        
+        # Try import ImageSequenceClip
+        try:
+            from moviepy.editor import ImageSequenceClip
+        except ImportError:
+            try:
+                from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+            except ImportError:
+                # Fallback or error
+                raise RuntimeError("Could not import ImageSequenceClip from moviepy")
+
+        output_frames = []
+        for i, frame in enumerate(frames):
+            mask = masks[i]
+            if mask is not None and np.sum(mask) > 0:
+                # Create colored mask overlay (e.g., green)
+                colored_mask = np.zeros_like(frame)
+                colored_mask[:, :, 1] = mask * 255 # Green channel
+                
+                # Blend
+                overlay = cv2.addWeighted(frame, 1, colored_mask, 0.5, 0)
+                # Convert BGR to RGB for MoviePy
+                rgb_frame = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+                output_frames.append(rgb_frame)
+            else:
+                # Convert original frame BGR to RGB
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                output_frames.append(rgb_frame)
+                
+        # Create clip and write
+        clip = ImageSequenceClip(output_frames, fps=fps)
+        
+        # Add audio from original video
+        try:
+            original_clip = VideoFileClip(video_path)
+            if original_clip.audio:
+                clip = clip.set_audio(original_clip.audio)
+        except Exception as e:
+            print(f"[SAM2 Video] Warning: Could not add audio: {e}")
+        
+        # Write to file using libx264 which is standard for web
+        clip.write_videofile(output_path, codec='libx264', audio_codec='aac', logger=None)
+        
+        print(f"[SAM2 Video] Saved to {output_path}")
+        return output_path
 
 class WhisperTranscriber:
     def __init__(self, model_id="openai/whisper-tiny"):
@@ -202,8 +416,15 @@ class WhisperTranscriber:
                 )
             
             transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            
+            # Post-process transcription to remove common hallucinations
+            # Whisper often outputs "you", "Thank you", or "Bye" on silent audio.
+            clean_text = transcription.strip()
+            if clean_text.lower() in ["you", "thank you.", "thank you", "bye", "you."]:
+                print(f"[Whisper] Detected hallucination '{clean_text}', filtering out.")
+                return ""
+                
             return transcription
-
         except Exception as e:
             print(f"Audio extraction failed: {e}")
             return f"Audio extraction failed: {str(e)}"
